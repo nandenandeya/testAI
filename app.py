@@ -1,6 +1,13 @@
 """
-FocusWebCam — Streamlit App (FIXED VERSION)
-Mengatasi masalah skor jomplang dengan post-processing
+FocusWebCam — Streamlit App
+============================
+Menggunakan streamlit-webrtc untuk akses kamera real-time,
+MediaPipe FaceMesh untuk deteksi wajah, dan model Logistic
+Regression yang sudah dilatih (focus_model.pkl).
+
+Cara jalankan:
+  pip install streamlit streamlit-webrtc av opencv-python-headless mediapipe scikit-learn
+  streamlit run app.py
 """
 
 import streamlit as st
@@ -15,9 +22,11 @@ from datetime import datetime
 import av
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
+# ─────────────────────────────────────────────
 # Page config
+# ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="FocusWebCam | Ethical AI Focus Detection (Fixed)",
+    page_title="FocusWebCam | Ethical AI Focus Detection",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -26,14 +35,18 @@ st.set_page_config(
 import mediapipe as mp
 mp_face_mesh = mp.solutions.face_mesh
 
+# ─────────────────────────────────────────────
 # Landmark indices
+# ─────────────────────────────────────────────
 LEFT_EYE   = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE  = [33,  160, 158, 133, 153, 144]
 MOUTH_TOP, MOUTH_BOTTOM = 13, 14
 MOUTH_LEFT, MOUTH_RIGHT = 78, 308
 NOSE_TIP, FACE_LEFT, FACE_RIGHT = 1, 234, 454
 
-# Model parameters (dari training_report_fixed.txt)
+# ─────────────────────────────────────────────
+# Model parameters (dari training_report.txt)
+# ─────────────────────────────────────────────
 MODEL_COEF = {"ear": 1.0494, "head_pose": -2.6625, "mouth_ratio": 2.0005}
 MODEL_INTERCEPT = -0.5234
 MODEL_SCALER = {
@@ -41,25 +54,14 @@ MODEL_SCALER = {
     "head_pose":   {"mean": 0.178, "std": 0.245},
     "mouth_ratio": {"mean": 0.068, "std": 0.082},
 }
-
-# 🔧 PERBAIKAN: Parameter untuk normalisasi
 ALERT_THRESHOLD  = 40
 EAR_OPEN         = 0.25
 EAR_CLOSED       = 0.15
-SMOOTHING_WINDOW = 5  # Increased from 3
+SMOOTHING_WINDOW = 3
 
-# 🔥 PARAMETER BARU UNTUK MENGATASI JOMPLANG
-MOUTH_MAX_REALISTIC = 0.12  # Nilai maksimal mouth ratio yang realistis
-EAR_MIN_REALISTIC = 0.10
-EAR_MAX_REALISTIC = 0.40
-HEAD_MAX_REALISTIC = 0.30
-
-# Bobot untuk ensemble scoring (lebih seimbang)
-WEIGHT_EAR = 0.50      # Mata: paling penting (dinaikkan)
-WEIGHT_HEAD = 0.35     # Posisi kepala
-WEIGHT_MOUTH = 0.15    # Mulut: diturunkan drastis
-
+# ─────────────────────────────────────────────
 # Fitur helpers
+# ─────────────────────────────────────────────
 def calc_ear(lm, indices, w, h):
     pts = [(lm[i].x * w, lm[i].y * h) for i in indices]
     A = np.hypot(pts[1][0]-pts[5][0], pts[1][1]-pts[5][1])
@@ -82,9 +84,7 @@ def calc_mouth(lm, w, h):
     right  = lm[MOUTH_RIGHT]
     vertical   = abs((top.y - bottom.y) * h)
     horizontal = abs((left.x - right.x) * w)
-    ratio = vertical / horizontal if horizontal else 0.0
-    # 🔥 PERBAIKAN: Batasi mouth ratio ke nilai realistis
-    return min(ratio, MOUTH_MAX_REALISTIC)
+    return vertical / horizontal if horizontal else 0.0
 
 def standardize(v, mean, std):
     return (v - mean) / std if std else 0.0
@@ -93,69 +93,14 @@ def sigmoid(z):
     return 1.0 / (1.0 + np.exp(-z))
 
 def predict_probability(ear, head_pose, mouth):
-    # 🔥 PERBAIKAN: Clamp semua fitur ke range realistis
-    ear = max(EAR_MIN_REALISTIC, min(EAR_MAX_REALISTIC, ear))
-    head_pose = min(head_pose, HEAD_MAX_REALISTIC)
-    mouth = min(mouth, MOUTH_MAX_REALISTIC)
-    
     ear_s   = standardize(ear,       **MODEL_SCALER["ear"])
     head_s  = standardize(head_pose, **MODEL_SCALER["head_pose"])
     mouth_s = standardize(mouth,     **MODEL_SCALER["mouth_ratio"])
-    
-    # Clamp standardized values to prevent extreme values
-    ear_s = max(-3, min(3, ear_s))
-    head_s = max(-3, min(3, head_s))
-    mouth_s = max(-3, min(3, mouth_s))
-    
-    logit = (MODEL_COEF["ear"]        * ear_s  +
-             MODEL_COEF["head_pose"]  * head_s +
-             MODEL_COEF["mouth_ratio"]* mouth_s +
-             MODEL_INTERCEPT)
+    logit   = (MODEL_COEF["ear"]        * ear_s  +
+               MODEL_COEF["head_pose"]  * head_s +
+               MODEL_COEF["mouth_ratio"]* mouth_s +
+               MODEL_INTERCEPT)
     return float(sigmoid(logit))
-
-def calculate_ensemble_score(ear, head_pose, mouth):
-    """
-    🔥 FUNGSI BARU: Ensemble scoring untuk mengatasi jomplang
-    Menggabungkan model LR dengan rule-based scoring
-    """
-    # 1. Logistic Regression score
-    lr_prob = predict_probability(ear, head_pose, mouth)
-    lr_score = lr_prob * 100
-    
-    # 2. Rule-based score (lebih seimbang)
-    # Normalisasi EAR (0.10→0, 0.40→100)
-    ear_norm = (ear - EAR_MIN_REALISTIC) / (EAR_MAX_REALISTIC - EAR_MIN_REALISTIC)
-    ear_norm = max(0, min(1, ear_norm))
-    ear_score = ear_norm * 100
-    
-    # Normalisasi Head Pose (0→100, 0.30→0)
-    head_norm = 1 - min(1, head_pose / HEAD_MAX_REALISTIC)
-    head_score = head_norm * 100
-    
-    # Normalisasi Mouth (0→100, 0.12→0)
-    mouth_norm = 1 - min(1, mouth / MOUTH_MAX_REALISTIC)
-    mouth_score = mouth_norm * 100
-    
-    # Weighted ensemble
-    weighted_score = (
-        WEIGHT_EAR * ear_score +
-        WEIGHT_HEAD * head_score +
-        WEIGHT_MOUTH * mouth_score
-    )
-    
-    # 3. Detect anomalies (jika LR score sangat berbeda)
-    if lr_score > 80 and ear < 0.20:
-        # Anomali: mulut terbuka menyebabkan LR score tinggi
-        # Gunakan weighted score lebih dominan
-        final_score = 0.4 * lr_score + 0.6 * weighted_score
-    elif lr_score < 40 and ear > 0.25 and mouth < 0.06:
-        # Anomali: skor terlalu rendah padahal kondisi normal
-        final_score = 0.3 * lr_score + 0.7 * weighted_score
-    else:
-        # Normal: blend 50-50
-        final_score = 0.5 * lr_score + 0.5 * weighted_score
-    
-    return max(0, min(100, final_score))
 
 def get_color(score):
     if score >= 65:  return (0, 255, 136)
@@ -163,20 +108,10 @@ def get_color(score):
     return (80, 80, 255)
 
 def explain_score(ear, head, mouth, score):
-    """
-    Improved explanation dengan deteksi anomali
-    """
     neg = []
-    if ear < 0.18: neg.append("mata tertutup/berkedip")
-    elif ear > 0.32: neg.append("mata terlalu terbuka (bisa jadi terkejut)")
-    
-    if head > 0.15: neg.append("kepala menoleh")
+    if ear   < 0.20: neg.append("mata tertutup/berkedip")
+    if head  > 0.15: neg.append("kepala menoleh")
     if mouth > 0.08: neg.append("mulut terbuka")
-    
-    # Deteksi anomali mulut terbuka tapi score tinggi
-    if score > 70 and mouth > 0.10 and ear < 0.22:
-        return f"⚠️ Skor {score}/100 (perlu koreksi: deteksi mulut terlalu dominan)"
-    
     if score >= 65:
         return f"✅ Fokus baik ({score}/100)"
     elif score >= 40:
@@ -186,13 +121,18 @@ def explain_score(ear, head, mouth, score):
         isu = ", ".join(neg) if neg else "kondisi tidak optimal"
         return f"⚠️ Tidak fokus ({score}/100) — {isu}"
 
-# Queue untuk kirim data
+# ─────────────────────────────────────────────
+# Queue untuk kirim data dari WebRTC → main thread
+# ─────────────────────────────────────────────
+# Pakai satu queue global yang persist di session_state
 if "result_queue" not in st.session_state:
     st.session_state.result_queue = queue.Queue(maxsize=5)
 
 result_queue: queue.Queue = st.session_state.result_queue
 
+# ─────────────────────────────────────────────
 # Session state
+# ─────────────────────────────────────────────
 def init_state():
     defaults = {
         "session_active":   False,
@@ -201,16 +141,16 @@ def init_state():
         "alert_count":      0,
         "low_score_count":  0,
         "last_alert_time":  0,
-        "log_entries":      ["— Sistem siap (Fixed Version) —"],
+        "log_entries":      ["— Sistem siap —"],
         "consent_given":    False,
         "consent_asked":    False,
+        # display values — diupdate dari queue
         "disp_score":       None,
         "disp_ear":         None,
         "disp_head":        None,
         "disp_mouth":       None,
         "disp_expl":        "",
         "disp_face":        False,
-        "anomaly_corrected": 0,  # Counter untuk anomali yang dikoreksi
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -218,7 +158,9 @@ def init_state():
 
 init_state()
 
-# Video Processor dengan ensemble scoring
+# ─────────────────────────────────────────────
+# Video Processor — kirim hasil via queue
+# ─────────────────────────────────────────────
 class FocusVideoProcessor:
     def __init__(self):
         self.face_mesh = mp_face_mesh.FaceMesh(
@@ -228,7 +170,6 @@ class FocusVideoProcessor:
             min_tracking_confidence=0.5,
         )
         self._smooth = deque(maxlen=SMOOTHING_WINDOW)
-        self.correction_count = 0
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
@@ -242,22 +183,15 @@ class FocusVideoProcessor:
             ear_r = calc_ear(lm, RIGHT_EYE, w, h)
             ear   = (ear_l + ear_r) / 2.0
             head  = calc_head_pose(lm, w, h)
-            mouth = calc_mouth(lm, w, h)  # Already capped
+            mouth = calc_mouth(lm, w, h)
 
-            # 🔥 MENGGUNAKAN ENSEMBLE SCORE
-            score_raw = calculate_ensemble_score(ear, head, mouth)
-            self._smooth.append(score_raw)
+            prob  = predict_probability(ear, head, mouth)
+            self._smooth.append(prob * 100)
             score = int(np.clip(round(np.mean(self._smooth)), 0, 100))
             color = get_color(score)
             expl  = explain_score(ear, head, mouth, score)
-            
-            # Deteksi koreksi anomali untuk logging
-            if (score > 70 and mouth > 0.10 and ear < 0.22) or \
-               (score < 40 and ear > 0.25 and mouth < 0.06):
-                self.correction_count += 1
-                st.session_state.anomaly_corrected = self.correction_count
 
-            # Kirim data
+            # Kirim ke main thread via queue (non-blocking)
             data = {
                 "face":  True,
                 "score": score,
@@ -274,7 +208,7 @@ class FocusVideoProcessor:
                 try:    result_queue.put_nowait(data)
                 except: pass
 
-            # Draw overlay
+            # ── Draw overlay ──
             for idx in LEFT_EYE + RIGHT_EYE:
                 pt = lm[idx]
                 cv2.circle(img, (int(pt.x*w), int(pt.y*h)), 2, color, -1)
@@ -286,9 +220,9 @@ class FocusVideoProcessor:
                 (int(fr.x*w), int(fb.y*h)),
                 color, 1)
 
-            # HUD with correction info
+            # HUD
             overlay = img.copy()
-            cv2.rectangle(overlay, (10, 10), (230, 115), (0,0,0), -1)
+            cv2.rectangle(overlay, (10, 10), (210, 105), (0,0,0), -1)
             cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
             cv2.putText(img, f"FOCUS: {score}", (18, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
@@ -296,14 +230,9 @@ class FocusVideoProcessor:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180,180,180), 1)
             cv2.putText(img, f"MOUTH:{mouth:.3f}", (18, 78),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180,180,180), 1)
-            
-            # 🔥 Tambahan info metode scoring
-            cv2.putText(img, "ENSEMBLE MODE", (18, 98),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100,100,100), 1)
-            
             bar_w = int((score/100)*182)
-            cv2.rectangle(img, (18, 108), (200, 117), (40,40,40), -1)
-            cv2.rectangle(img, (18, 108), (18+bar_w, 117), color, -1)
+            cv2.rectangle(img, (18, 88), (200, 97), (40,40,40), -1)
+            cv2.rectangle(img, (18, 88), (18+bar_w, 97), color, -1)
 
         else:
             cv2.putText(img, "Tidak ada wajah terdeteksi", (20, 40),
@@ -320,7 +249,9 @@ class FocusVideoProcessor:
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# Drain queue
+# ─────────────────────────────────────────────
+# Drain queue → update session_state display values
+# ─────────────────────────────────────────────
 def drain_queue():
     latest = None
     while True:
@@ -342,6 +273,7 @@ def drain_queue():
         score = latest["score"]
         st.session_state.score_history.append(score)
 
+        # Alert logic
         if score < ALERT_THRESHOLD:
             st.session_state.low_score_count += 1
         else:
@@ -359,41 +291,63 @@ def drain_queue():
 
     return True
 
-# CSS (sama seperti sebelumnya, bisa ditambahkan info koreksi)
+# ─────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────
 st.markdown("""
 <style>
-/* CSS sama seperti sebelumnya, tambahan: */
-.score-card-fixed {
-    background: #111;
-    border: 1px solid #2a2a2a;
-    border-radius: 4px;
-    padding: 16px;
-    margin-bottom: 8px;
-    position: relative;
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+:root {
+  --bg:#0a0a0a; --surface:#111; --border:#2a2a2a;
+  --accent:#00ff88; --accent2:#ff4444; --accent3:#ffcc00;
+  --text:#e8e8e8; --text-dim:#555; --text-mid:#888;
 }
-.badge-ensemble {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    font-family: 'Space Mono', monospace;
-    font-size: 0.45rem;
-    color: #00ff88;
-    background: rgba(0,255,136,0.1);
-    padding: 2px 6px;
-    border-radius: 2px;
-}
+html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;font-family:'Syne',sans-serif;}
+[data-testid="stHeader"],[data-testid="stToolbar"],#MainMenu,footer{display:none!important;}
+[data-testid="stSidebar"]{display:none!important;}
+.app-title{font-family:'Syne',sans-serif;font-weight:800;font-size:1.3rem;letter-spacing:.1em;color:#e8e8e8;}
+.logo-dot{display:inline-block;width:10px;height:10px;background:#00ff88;border-radius:50%;
+  box-shadow:0 0 12px #00ff88;margin-right:10px;animation:pulse 2s infinite;}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 12px #00ff88;}50%{opacity:.4;box-shadow:0 0 4px #00ff88;}}
+.hstatus{font-family:'Space Mono',monospace;font-size:.65rem;color:#555;letter-spacing:.12em;text-align:right;}
+.score-card{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:16px;margin-bottom:8px;}
+.score-label{font-family:'Space Mono',monospace;font-size:.58rem;color:#555;letter-spacing:.15em;margin-bottom:6px;}
+.score-big{font-family:'Space Mono',monospace;font-size:3.2rem;font-weight:700;line-height:1;}
+.score-state{font-family:'Space Mono',monospace;font-size:.65rem;letter-spacing:.1em;margin-top:4px;}
+.feat-card{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:10px;text-align:center;}
+.feat-name{font-family:'Space Mono',monospace;font-size:.46rem;color:#555;letter-spacing:.1em;margin-bottom:4px;}
+.feat-val{font-family:'Space Mono',monospace;font-size:.85rem;color:#e8e8e8;}
+.feat-icon{font-size:.95rem;margin-bottom:3px;}
+.stats-card{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:14px;margin-bottom:8px;}
+.stats-title{font-family:'Space Mono',monospace;font-size:.56rem;color:#555;letter-spacing:.15em;margin-bottom:10px;}
+.stat-val{font-family:'Space Mono',monospace;font-size:1rem;color:#00ff88;font-weight:700;}
+.stat-lbl{font-family:'Space Mono',monospace;font-size:.44rem;color:#555;letter-spacing:.08em;}
+.log-card{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:14px;}
+.log-title{font-family:'Space Mono',monospace;font-size:.56rem;color:#555;letter-spacing:.15em;margin-bottom:8px;}
+.log-entry{font-family:'Space Mono',monospace;font-size:.53rem;color:#888;padding:3px 0;border-bottom:1px solid #1a1a1a;}
+.log-alert{color:#ff4444!important;} .log-focus{color:#00ff88!important;} .log-sys{color:#444!important;font-style:italic;}
+.expl-card{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:12px;
+  font-family:'Space Mono',monospace;font-size:.6rem;color:#888;margin-bottom:8px;}
+.divider{border-top:1px solid #2a2a2a;margin:10px 0;}
+.privacy-note{font-family:'Space Mono',monospace;font-size:.48rem;color:#2a2a2a;text-align:center;margin-top:8px;}
+.stButton>button{background:transparent!important;border:1px solid #00ff88!important;color:#00ff88!important;
+  font-family:'Space Mono',monospace!important;font-size:.75rem!important;letter-spacing:.15em!important;
+  width:100%;border-radius:4px!important;}
+.stButton>button:hover{background:#00ff88!important;color:#0a0a0a!important;}
+div[data-testid="stProgress"]>div>div{background:linear-gradient(90deg,#00ff88,#00cc6a)!important;}
 </style>
 """, unsafe_allow_html=True)
 
-# Consent dialog (sama)
+# ─────────────────────────────────────────────
+# Consent dialog
+# ─────────────────────────────────────────────
 if not st.session_state.consent_asked:
     @st.dialog("📋 Persetujuan Privasi")
     def _consent():
         st.markdown("""
-        **FocusWebCam (Fixed Version)** memproses data wajah Anda untuk mendeteksi tingkat fokus.
+        **FocusWebCam** memproses data wajah Anda untuk mendeteksi tingkat fokus.
         - ✅ Semua data diproses **lokal di perangkat Anda**
         - ✅ Video tidak pernah dikirim ke server manapun
-        - ✅ Menggunakan **Ensemble Scoring** untuk akurasi lebih baik
         - ✅ Hanya skor agregat yang disimpan di session
         """)
         c1, c2 = st.columns(2)
@@ -401,7 +355,7 @@ if not st.session_state.consent_asked:
             if st.button("✅ Izinkan", use_container_width=True):
                 st.session_state.consent_given = True
                 st.session_state.consent_asked = True
-                st.session_state.log_entries.insert(0, "✅ Persetujuan diberikan (Fixed Version)")
+                st.session_state.log_entries.insert(0, "✅ Persetujuan diberikan")
                 st.rerun()
         with c2:
             if st.button("❌ Tolak", use_container_width=True):
@@ -411,30 +365,38 @@ if not st.session_state.consent_asked:
                 st.rerun()
     _consent()
 
+# ─────────────────────────────────────────────
 # Header
+# ─────────────────────────────────────────────
 hc1, hc2 = st.columns([3, 1])
 with hc1:
-    st.markdown('<div class="app-title"><span class="logo-dot"></span>FocusWebCam <span style="font-size:0.6rem;color:#00ff88;">FIXED v2</span></div>',
+    st.markdown('<div class="app-title"><span class="logo-dot"></span>FocusWebCam</div>',
                 unsafe_allow_html=True)
 with hc2:
     if st.session_state.session_active:
-        status = "SESI AKTIF (ENSEMBLE)"
+        status = "SESI AKTIF"
     elif st.session_state.consent_given:
-        status = "SIAP — Ensemble Mode"
+        status = "SIAP — Model LR"
     else:
         status = "MODE TERBATAS"
     st.markdown(f'<div class="hstatus">{status}</div>', unsafe_allow_html=True)
 
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
+# ─────────────────────────────────────────────
+# Drain queue setiap rerun
+# ─────────────────────────────────────────────
 drain_queue()
 
+# ─────────────────────────────────────────────
 # Layout
+# ─────────────────────────────────────────────
 cam_col, info_col = st.columns([3, 2])
 
 with cam_col:
+    # Tombol start/stop
     if not st.session_state.session_active:
-        if st.button("▶  MULAI SESI (ENSEMBLE)", key="btn_start"):
+        if st.button("▶  MULAI SESI", key="btn_start"):
             st.session_state.session_active  = True
             st.session_state.session_start   = time.time()
             st.session_state.score_history   = []
@@ -446,7 +408,7 @@ with cam_col:
             st.session_state.disp_head       = None
             st.session_state.disp_mouth      = None
             ts = datetime.now().strftime("%H:%M:%S")
-            st.session_state.log_entries.insert(0, f"🎯 [{ts}] Sesi dimulai (Ensemble Scoring)")
+            st.session_state.log_entries.insert(0, f"🎯 [{ts}] Sesi dimulai")
             st.rerun()
     else:
         if st.button("⏹  HENTIKAN SESI", key="btn_stop"):
@@ -456,15 +418,16 @@ with cam_col:
                 pct = round(sum(1 for s in hist if s >= ALERT_THRESHOLD)/len(hist)*100)
                 ts  = datetime.now().strftime("%H:%M:%S")
                 st.session_state.log_entries.insert(
-                    0, f"📊 [{ts}] Selesai — avg {avg}, fokus {pct}%, {st.session_state.alert_count} alert, {st.session_state.anomaly_corrected} koreksi")
+                    0, f"📊 [{ts}] Selesai — avg {avg}, fokus {pct}%, {st.session_state.alert_count} alert")
             st.session_state.session_active = False
             st.rerun()
 
+    # WebRTC
     rtc_config = RTCConfiguration(
         {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
     )
     ctx = webrtc_streamer(
-        key="focus-cam-fixed",
+        key="focus-cam",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=rtc_config,
         video_processor_factory=FocusVideoProcessor,
@@ -473,8 +436,11 @@ with cam_col:
     )
 
     if not st.session_state.session_active:
-        st.info("Tekan **MULAI SESI** setelah kamera aktif. Menggunakan Ensemble Scoring untuk akurasi lebih baik.", icon="🎯")
+        st.info("Tekan **MULAI SESI** setelah kamera aktif untuk memulai deteksi.", icon="📷")
 
+# ─────────────────────────────────────────────
+# Panel kanan
+# ─────────────────────────────────────────────
 with info_col:
     score = st.session_state.disp_score
     ear   = st.session_state.disp_ear
@@ -482,6 +448,7 @@ with info_col:
     mouth = st.session_state.disp_mouth
     expl  = st.session_state.disp_expl
 
+    # Score card
     if score is not None:
         color_hex = "#00ff88" if score >= 65 else ("#ffcc00" if score >= 40 else "#ff4444")
         state_txt = "FOKUS" if score >= 65 else ("PERHATIAN" if score >= 40 else "TIDAK FOKUS")
@@ -491,8 +458,7 @@ with info_col:
         score = 0
 
     st.markdown(f"""
-    <div class="score-card" style="position:relative;">
-      <div class="badge-ensemble">ENSEMBLE</div>
+    <div class="score-card">
       <div class="score-label">FOCUS SCORE</div>
       <div class="score-big" style="color:{color_hex}">{score_disp}
         <span style="font-size:.9rem;color:#555"> /100</span>
@@ -500,7 +466,7 @@ with info_col:
       <div class="score-state" style="color:{color_hex}">{state_txt}</div>
     </div>""", unsafe_allow_html=True)
 
-    st.progress(int(score) / 100 if score else 0)
+    st.progress(int(score) / 100)
 
     # Feature cards
     f1, f2, f3 = st.columns(3)
@@ -523,12 +489,9 @@ with info_col:
 
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
+    # Explanation
     if expl:
         st.markdown(f'<div class="expl-card">📊 {expl}</div>', unsafe_allow_html=True)
-    
-    # Info koreksi anomali
-    if st.session_state.anomaly_corrected > 0:
-        st.caption(f"🔧 {st.session_state.anomaly_corrected} anomali skor telah dikoreksi")
 
     # Session stats
     hist = st.session_state.score_history
@@ -559,10 +522,12 @@ with info_col:
         logs_html += f'<div class="log-entry {cls}">{entry}</div>'
     st.markdown(logs_html + "</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="privacy-note">🔒 Data diproses lokal | 🎯 Ensemble Scoring (LR + Rule-based)</div>',
+    st.markdown('<div class="privacy-note">🔒 Data diproses lokal — tidak dikirim ke server</div>',
                 unsafe_allow_html=True)
 
-# Auto-refresh
+# ─────────────────────────────────────────────
+# Auto-refresh — hanya saat kamera aktif
+# ─────────────────────────────────────────────
 if ctx.state.playing:
     time.sleep(0.5)
     st.rerun()
